@@ -14,6 +14,11 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
+type client struct {
+	serverSocket *ssh.ServerConn
+	x11Sockets   []net.Listener
+}
+
 type server struct {
 	cfg                 Config
 	logger              log.Logger
@@ -21,12 +26,13 @@ type server struct {
 	listenSocket        net.Listener
 	wg                  *sync.WaitGroup
 	lock                *sync.Mutex
-	clientSockets       map[*ssh.ServerConn]bool
+	clientSockets       map[string]*client
 	nextGlobalRequestID uint64
 	nextChannelID       uint64
 	hostKeys            []ssh.Signer
 	shutdownHandlers    *shutdownRegistry
 	shuttingDown        bool
+	lifecycle           service.Lifecycle
 }
 
 func (s *server) String() string {
@@ -35,11 +41,12 @@ func (s *server) String() string {
 
 func (s *server) RunWithLifecycle(lifecycle service.Lifecycle) error {
 	s.lock.Lock()
+	s.lifecycle = lifecycle
 	alreadyRunning := false
 	if s.listenSocket != nil {
 		alreadyRunning = true
 	} else {
-		s.clientSockets = make(map[*ssh.ServerConn]bool)
+		s.clientSockets = make(map[string]*client)
 	}
 	s.shuttingDown = false
 	s.lock.Unlock()
@@ -73,6 +80,7 @@ func (s *server) RunWithLifecycle(lifecycle service.Lifecycle) error {
 		}
 	}()
 	for {
+		s.logger.Debug("Waiting for connection")
 		tcpConn, err := netListener.Accept()
 		if err != nil {
 			// Assume listen socket closed
@@ -102,10 +110,13 @@ func (s *server) disconnectClients(lifecycle service.Lifecycle, allClientsExited
 	}
 
 	s.lock.Lock()
-	for serverSocket := range s.clientSockets {
-		_ = serverSocket.Close()
+	for _, client := range s.clientSockets {
+		for i := range client.x11Sockets {
+			_ = client.x11Sockets[i].Close()
+		}
+		_ = client.serverSocket.Close()
 	}
-	s.clientSockets = map[*ssh.ServerConn]bool{}
+	s.clientSockets = map[string]*client{}
 	s.lock.Unlock()
 }
 
@@ -291,13 +302,16 @@ func (s *server) handleConnection(conn net.Conn) {
 		return
 	}
 	s.lock.Lock()
-	s.clientSockets[sshConn] = true
+	s.clientSockets[connectionID] = &client{
+		serverSocket: sshConn,
+	}
 	sshShutdownHandlerID := fmt.Sprintf("ssh-%s", connectionID)
 	s.lock.Unlock()
 
 	s.wg.Add(1)
 	go func() {
 		_ = sshConn.Wait()
+		//@TODO close x11 sockets
 		s.logger.Debugf("Client disconnected: %s", addr.IP.String())
 		s.shutdownHandlers.Unregister(shutdownHandlerID)
 		s.shutdownHandlers.Unregister(sshShutdownHandlerID)
@@ -339,6 +353,7 @@ func (s *server) handleChannels(connectionID string, channels <-chan ssh.NewChan
 		s.nextChannelID++
 		if newChannel.ChannelType() != "session" {
 			connection.OnUnsupportedChannel(channelID, newChannel.ChannelType(), newChannel.ExtraData())
+			s.logger.Debugf("Rejecting unsupported channel type %s", newChannel.ChannelType())
 			if err := newChannel.Reject(ssh.UnknownChannelType, "unsupported channel type"); err != nil {
 				s.logger.Debugf("failed to send channel rejection for channel type %s", newChannel.ChannelType())
 			}
@@ -351,6 +366,13 @@ func (s *server) handleChannels(connectionID string, channels <-chan ssh.NewChan
 type envRequestPayload struct {
 	Name  string
 	Value string
+}
+
+type x11RequestPayload struct {
+	SingleConnection bool
+	X11AuthProtocol  string
+	X11AuthCookie    string
+	X11ScreenNumber  uint32
 }
 
 type execRequestPayload struct {
@@ -405,9 +427,11 @@ const (
 	requestTypeSubsystem requestType = "subsystem"
 	requestTypeWindow    requestType = "window-change"
 	requestTypeSignal    requestType = "signal"
+	requestTypeX11       requestType = "x11-req"
 )
 
 type channelWrapper struct {
+	client         *client
 	channel        ssh.Channel
 	logger         log.Logger
 	lock           *sync.Mutex
@@ -513,6 +537,7 @@ func (c *channelWrapper) onClose() {
 
 func (s *server) handleSessionChannel(connectionID string, channelID uint64, newChannel ssh.NewChannel, connection SSHConnectionHandler) {
 	channelCallbacks := &channelWrapper{
+		client: s.clientSockets[connectionID],
 		logger: s.logger,
 		lock:   &sync.Mutex{},
 	}
@@ -541,7 +566,7 @@ func (s *server) handleSessionChannel(connectionID string, channelID uint64, new
 		}
 		requestID := nextRequestID
 		nextRequestID++
-		s.handleChannelRequest(requestID, request, handlerChannel)
+		s.handleChannelRequest(requestID, request, handlerChannel, channelCallbacks)
 	}
 }
 
@@ -550,6 +575,10 @@ func (s *server) unmarshalEnv(request *ssh.Request) (payload envRequestPayload, 
 }
 
 func (s *server) unmarshalPty(request *ssh.Request) (payload ptyRequestPayload, err error) {
+	return payload, ssh.Unmarshal(request.Payload, &payload)
+}
+
+func (s *server) unmarshalX11(request *ssh.Request) (payload x11RequestPayload, err error) {
 	return payload, ssh.Unmarshal(request.Payload, &payload)
 }
 
@@ -592,6 +621,8 @@ func (s *server) unmarshalPayload(request *ssh.Request) (payload interface{}, er
 		return s.unmarshalWindow(request)
 	case requestTypeSignal:
 		return s.unmarshalSignal(request)
+	case requestTypeX11:
+		return s.unmarshalX11(request)
 	default:
 		return nil, nil
 	}
@@ -601,6 +632,7 @@ func (s *server) handleChannelRequest(
 	requestID uint64,
 	request *ssh.Request,
 	sessionChannel SessionChannelHandler,
+	channelCallbacks *channelWrapper,
 ) {
 	reply := func(success bool, message string, reason error) {
 		if request.WantReply {
@@ -629,8 +661,10 @@ func (s *server) handleChannelRequest(
 		requestType(request.Type),
 		payload,
 		sessionChannel,
+		channelCallbacks,
 	); err != nil {
 		reply(false, err.Error(), err)
+		s.logger.Debugf("Handling channel request %s failed: %v", requestType(request.Type), err)
 		return
 	}
 	reply(true, "", nil)
@@ -641,7 +675,9 @@ func (s *server) handleDecodedChannelRequest(
 	requestType requestType,
 	payload interface{},
 	sessionChannel SessionChannelHandler,
+	channelCallbacks *channelWrapper,
 ) error {
+	s.logger.Debug(string(requestType))
 	switch requestType {
 	case requestTypeEnv:
 		return s.onEnvRequest(requestID, sessionChannel, payload)
@@ -657,6 +693,8 @@ func (s *server) handleDecodedChannelRequest(
 		return s.onChannel(requestID, sessionChannel, payload)
 	case requestTypeSignal:
 		return s.onSignal(requestID, sessionChannel, payload)
+	case requestTypeX11:
+		return s.onX11Request(requestID, sessionChannel, payload, channelCallbacks)
 	}
 	return nil
 }
@@ -679,6 +717,107 @@ func (s *server) onPtyRequest(requestID uint64, sessionChannel SessionChannelHan
 		payload.(ptyRequestPayload).Height,
 		payload.(ptyRequestPayload).ModeList,
 	)
+}
+
+func (s *server) handleX11Connection(
+	connection net.Conn,
+	channel ssh.Channel,
+) {
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			n, err := connection.Read(buf)
+			if err != nil {
+				s.logger.Error("Failed reading from x11 socket")
+				break
+			}
+			s.logger.Debugf("reading from connection %d", n)
+			if n > 0 {
+				n, err = channel.Write(buf[:n])
+				if err != nil {
+					s.logger.Error("Failed writing to x11 socket")
+				}
+				s.logger.Debugf("writing to channel %d", n)
+			}
+		}
+	}()
+
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			n, err := channel.Read(buf)
+			if err != nil {
+				s.logger.Error("Failed reading from x11 socket")
+				break
+			}
+			s.logger.Debugf("reading from channel %d", n)
+			if n > 0 {
+				n, err = connection.Write(buf[:n])
+				if err != nil {
+					s.logger.Error("Failed writing to x11 socket")
+				}
+				s.logger.Debugf("writing to connection %d", n)
+			}
+		}
+	}()
+}
+
+func (s *server) onX11Request(
+	requestID uint64,
+	sessionChannel SessionChannelHandler,
+	payload interface{},
+	channelCallbacks *channelWrapper,
+) (err error) {
+	var displayNumber int
+
+	listenConfig := net.ListenConfig{
+		Control: s.socketControl,
+	}
+
+	var listener net.Listener
+	for displayNumber := 0; displayNumber < 1000; displayNumber++ { //@TODO add consts
+		port := displayNumber + 6000 //@TODO add const
+
+		listener, err = listenConfig.Listen(s.lifecycle.Context(), "tcp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("Allocating x11 listen port failed (%v)", err)
+	}
+
+	channelCallbacks.client.x11Sockets = append(channelCallbacks.client.x11Sockets, listener)
+
+	go func(l net.Listener, c ssh.Channel) {
+		for {
+			s.logger.Debug("Waiting for X11 program")
+			tcpConn, err := l.Accept()
+			if err != nil {
+				// Assume listen socket closed
+				break
+			}
+			go s.handleX11Connection(tcpConn, c)
+		}
+	}(listener, channelCallbacks.channel)
+
+	displayStr := fmt.Sprintf("localhost:%d.0", displayNumber)
+	err = sessionChannel.OnEnvRequest(
+		requestID,
+		"DISPLAY",
+		displayStr,
+	)
+	if err != nil {
+		return fmt.Errorf("Setting DISPLAY enviroment variable failed (%v)", err)
+	}
+	// return sessionChannel.OnX11Request(
+	// 	requestID,
+	// 	payload.(x11RequestPayload).SingleConnection,
+	// 	payload.(x11RequestPayload).X11AuthProtocol,
+	// 	payload.(x11RequestPayload).X11AuthCookie,
+	// 	payload.(x11RequestPayload).X11ScreenNumber,
+	// )
+	return err
 }
 
 func (s *server) onShell(
