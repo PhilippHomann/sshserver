@@ -6,12 +6,19 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/containerssh/log"
 	"github.com/containerssh/service"
 	"golang.org/x/crypto/ssh"
+)
+
+const (
+	x11BasePort = 6000
+	x11BindBase = 6010
 )
 
 type client struct {
@@ -368,13 +375,6 @@ type envRequestPayload struct {
 	Value string
 }
 
-type x11RequestPayload struct {
-	SingleConnection bool
-	X11AuthProtocol  string
-	X11AuthCookie    string
-	X11ScreenNumber  uint32
-}
-
 type execRequestPayload struct {
 	Exec string
 }
@@ -415,6 +415,18 @@ type exitSignalPayload struct {
 	CoreDumped   bool
 	ErrorMessage string
 	LanguageTag  string
+}
+
+type x11Payload struct {
+	OriginatorIP   string
+	OriginatorPort uint32
+}
+
+type x11RequestPayload struct {
+	SingleConnection bool
+	X11AuthProtocol  string
+	X11AuthCookie    string
+	X11ScreenNumber  uint32
 }
 
 type requestType string
@@ -719,107 +731,6 @@ func (s *server) onPtyRequest(requestID uint64, sessionChannel SessionChannelHan
 	)
 }
 
-func (s *server) handleX11Connection(
-	connection net.Conn,
-	channel ssh.Channel,
-) {
-	go func() {
-		buf := make([]byte, 1024)
-		for {
-			n, err := connection.Read(buf)
-			if err != nil {
-				s.logger.Error("Failed reading from x11 socket")
-				break
-			}
-			s.logger.Debugf("reading from connection %d", n)
-			if n > 0 {
-				n, err = channel.Write(buf[:n])
-				if err != nil {
-					s.logger.Error("Failed writing to x11 socket")
-				}
-				s.logger.Debugf("writing to channel %d", n)
-			}
-		}
-	}()
-
-	go func() {
-		buf := make([]byte, 1024)
-		for {
-			n, err := channel.Read(buf)
-			if err != nil {
-				s.logger.Error("Failed reading from x11 socket")
-				break
-			}
-			s.logger.Debugf("reading from channel %d", n)
-			if n > 0 {
-				n, err = connection.Write(buf[:n])
-				if err != nil {
-					s.logger.Error("Failed writing to x11 socket")
-				}
-				s.logger.Debugf("writing to connection %d", n)
-			}
-		}
-	}()
-}
-
-func (s *server) onX11Request(
-	requestID uint64,
-	sessionChannel SessionChannelHandler,
-	payload interface{},
-	channelCallbacks *channelWrapper,
-) (err error) {
-	var displayNumber int
-
-	listenConfig := net.ListenConfig{
-		Control: s.socketControl,
-	}
-
-	var listener net.Listener
-	for displayNumber := 0; displayNumber < 1000; displayNumber++ { //@TODO add consts
-		port := displayNumber + 6000 //@TODO add const
-
-		listener, err = listenConfig.Listen(s.lifecycle.Context(), "tcp", fmt.Sprintf("127.0.0.1:%d", port))
-		if err == nil {
-			break
-		}
-	}
-	if err != nil {
-		return fmt.Errorf("Allocating x11 listen port failed (%v)", err)
-	}
-
-	channelCallbacks.client.x11Sockets = append(channelCallbacks.client.x11Sockets, listener)
-
-	go func(l net.Listener, c ssh.Channel) {
-		for {
-			s.logger.Debug("Waiting for X11 program")
-			tcpConn, err := l.Accept()
-			if err != nil {
-				// Assume listen socket closed
-				break
-			}
-			go s.handleX11Connection(tcpConn, c)
-		}
-	}(listener, channelCallbacks.channel)
-
-	displayStr := fmt.Sprintf("localhost:%d.0", displayNumber)
-	err = sessionChannel.OnEnvRequest(
-		requestID,
-		"DISPLAY",
-		displayStr,
-	)
-	if err != nil {
-		return fmt.Errorf("Setting DISPLAY enviroment variable failed (%v)", err)
-	}
-	// return sessionChannel.OnX11Request(
-	// 	requestID,
-	// 	payload.(x11RequestPayload).SingleConnection,
-	// 	payload.(x11RequestPayload).X11AuthProtocol,
-	// 	payload.(x11RequestPayload).X11AuthCookie,
-	// 	payload.(x11RequestPayload).X11ScreenNumber,
-	// )
-	return err
-}
-
 func (s *server) onShell(
 	requestID uint64,
 	sessionChannel SessionChannelHandler,
@@ -866,6 +777,104 @@ func (s *server) onChannel(requestID uint64, sessionChannel SessionChannelHandle
 		payload.(windowRequestPayload).Width,
 		payload.(windowRequestPayload).Height,
 	)
+}
+
+func (s *server) handleX11Connection(
+	x11Conn net.Conn,
+	sshConn ssh.Conn,
+) {
+	addr := x11Conn.RemoteAddr().String()
+	n := strings.LastIndex(addr, ":")
+	if n < 0 {
+		s.logger.Errorf("Unable to split addr (%s) into IP and port", addr)
+		return
+	}
+	port, err := strconv.ParseUint(addr[n+1:], 10, 32)
+	if err != nil {
+		s.logger.Errorf("Unable to parse port from addr (%v)", err)
+		return
+	}
+	channel, _, err := sshConn.OpenChannel(
+		"x11",
+		ssh.Marshal(x11Payload{
+			OriginatorIP:   addr[:n],
+			OriginatorPort: uint32(port),
+		}))
+	if err != nil {
+		if !errors.Is(err, io.EOF) {
+			s.logger.Debugf("failed to send exit status to client (%v)", err)
+		}
+	}
+
+	bridge := func(r io.Reader, w io.Writer) {
+		// @TODO find a way to get actual window size?!
+		buf := make([]byte, 1<<15)
+		n, err := io.CopyBuffer(w, r, buf)
+		if err != nil {
+			s.logger.Warningf("io.Copy failed for x11 (%v)", err)
+		} else {
+			s.logger.Debugf("io.Copy copied %d bytes", n)
+		}
+	}
+	go bridge(channel, x11Conn)
+	go bridge(x11Conn, channel)
+
+}
+
+func (s *server) onX11Request(
+	requestID uint64,
+	sessionChannel SessionChannelHandler,
+	payload interface{},
+	channelCallbacks *channelWrapper,
+) (err error) {
+	x11Request := payload.(x11RequestPayload)
+
+	var listener net.Listener
+	var port int
+	listenConfig := net.ListenConfig{
+		Control: s.socketControl,
+	}
+	// dont create listen port, set docker hostconfig instead
+	for port = x11BindBase; port < x11BindBase+1000; port++ {
+		// @TODO IPv6?
+		listener, err = listenConfig.Listen(s.lifecycle.Context(), "tcp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("Allocating x11 listen port failed (%v)", err)
+	}
+	channelCallbacks.client.x11Sockets = append(channelCallbacks.client.x11Sockets, listener)
+
+	display := fmt.Sprintf("localhost:%d.%d", port-x11BasePort, x11Request.X11ScreenNumber)
+	if err := sessionChannel.OnEnvRequest(
+		requestID,
+		"DISPLAY",
+		display,
+	); err != nil {
+		return fmt.Errorf("Setting DISPLAY enviroment variable failed (%v)", err)
+	}
+
+	//@TODO run in container or locally and bind xauthority file
+	xauth := exec.Command("xauth", "add", display, x11Request.X11AuthProtocol, x11Request.X11AuthCookie)
+	if err := xauth.Run(); err != nil {
+		return fmt.Errorf("Running xauth failed (%v)", err)
+	}
+
+	go func() {
+		for {
+			s.logger.Debug("Waiting for X11 program")
+			tcpConn, err := listener.Accept()
+			if err != nil {
+				// Assume listen socket closed
+				break
+			}
+			go s.handleX11Connection(tcpConn, channelCallbacks.client.serverSocket)
+		}
+	}()
+
+	return nil
 }
 
 func (s *server) shutdownHandler(lifecycle service.Lifecycle, exited chan struct{}) {
